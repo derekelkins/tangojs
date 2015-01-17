@@ -78,17 +78,15 @@ function TangoRuntime(logStore, stream) {
         });
     };
 
-    self.getOidByName = function(typeName, name) {
+    self.getOidByName = function(name) {
         return persistentNameMap.get(self, name)
-                .then(function(nameDict) {
-                    if(nameDict && nameDict[typeName]) {
-                        return nameDict[typeName];
-                    } else {
-                        var oid = newOid();
-                        nameDict = nameDict || {};
-                        nameDict[typeName] = oid;
-                        return persistentNameMap.put(self, name, nameDict)
+                .then(function(oid) {
+                    if(oid === void(0)) {
+                        oid = newOid();
+                        return persistentNameMap.put(self, name, oid)
                                 .then(function() { return oid; });
+                    } else {
+                        return oid;
                     }
                 });
     };
@@ -109,7 +107,7 @@ function TangoRuntime(logStore, stream) {
     };
 
     /**
-     * This method will fetch the latest version of the object of the given name and type.
+     * This method will fetch the latest version of the object of the given name.
      * If the object has not been created, anywhere currently, it will be created.
      *
      * @method fetch
@@ -120,7 +118,7 @@ function TangoRuntime(logStore, stream) {
      */
     self.fetch = function(typeName, name) {
         var args = Array.prototype.slice.call(arguments, 2);
-        return self.getOidByName(typeName, name)
+        return self.getOidByName(name)
                 .then(function(oid) { return internalFetch(typeName, name, oid, args); });
     };
 
@@ -170,11 +168,29 @@ function TangoRuntime(logStore, stream) {
         return deferred.promise;
     };
 
+    var applyInit = function(entry, oid) {
+        var factory = typeRegistry[entry.typeName];
+        if(objectRegistry[oid] !== void(0)) throw 'Tango.Runtime.applyInit: Duplicate init entries.';
+        if(factory === void(0)) throw 'Tango.Runtime.applyInit: Unrecognized type: ' + entry.typeName;
+        objectRegistry[oid] = factory.apply(null, entry.state);
+    };
+
     var applyWrite = function(entry, offset) {
         var oid = entry.oid;
-        var obj = objectRegistry[oid];
-        if(obj === void(0)) throw 'Tango.Runtime.applyWrite: Unregistered object for OID: ' + oid;
-        obj.applyUpdate(entry.value, offset);
+        var entryType = entry.Type;
+        if(entryType === INIT_ENTRY_TYPE) {
+            applyInit(entry, oid);
+        } else {
+            var obj = objectRegistry[oid];
+            if(obj === void(0)) throw 'Tango.Runtime.applyWrite: Unregistered object for OID: ' + oid;
+            if(entryType === UPDATE_ENTRY_TYPE) {
+                obj.applyUpdate(entry.value, offset); 
+            } else if(entryType === CHECKPOINT_ENTRY_TYPE) {
+                obj.applyCheckpoint(entry.state, offset); 
+            } else {
+                throw 'Tango.Runtime.applyWrite: Unexpected entry type, ' + entryType + ', at offset ' + offset;
+            }
+        }
         advanceTo(oid, offset);
     };
 
@@ -200,10 +216,7 @@ function TangoRuntime(logStore, stream) {
         switch(entry.type) {
             case INIT_ENTRY_TYPE:
                 oid = entry.oid;
-                var factory = typeRegistry[entry.typeName];
-                if(objectRegistry[oid] !== void(0)) throw 'Tango.Runtime.handleEntry: Duplicate init entries.';
-                if(factory === void(0)) throw 'Tango.Runtime.handleEntry: Unrecognized type: ' + entry.typeName;
-                objectRegistry[oid] = factory.apply(null, entry.state);
+                applyInit(entry, oid);
                 advanceTo(oid, offset);
                 break;
             case CHECKPOINT_ENTRY_TYPE:
@@ -214,7 +227,11 @@ function TangoRuntime(logStore, stream) {
                 advanceTo(oid, offset);
                 break;
             case UPDATE_ENTRY_TYPE:
-                applyWrite(entry, offset);
+                oid = entry.oid;
+                obj = objectRegistry[oid];
+                if(obj === void(0)) throw 'Tango.Runtime.handleEntry: Unregistered object for OID: ' + oid;
+                obj.applyUpdate(entry.value, offset); 
+                advanceTo(oid, offset);
                 break;
             case COMMIT_ENTRY_TYPE:
                 var readSet = entry.readSet, writeSet = entry.writeSet;
@@ -450,7 +467,7 @@ function TangoRuntime(logStore, stream) {
 
     self.init = function() {
         var nameDict = {};
-        nameDict[Tango.Map.TYPE_NAME] = 0;
+        nameDict[TANGO_NAME_MAP_NAME] = 0;
         return internalFetch(Tango.Map.TYPE_NAME, TANGO_NAME_MAP_NAME, 0, [nameDict])
                 .then(function(pm) { persistentNameMap = pm; return self; });
     };
@@ -708,8 +725,8 @@ function TangoMap(oid, initialMapping) {
     };
 }
 TangoMap.TYPE_NAME = 'Tango.Map';
-TangoMap.factory = function(oid) {
-    return new TangoMap(oid);
+TangoMap.factory = function(oid, initialMapping) {
+    return new TangoMap(oid, initialMapping);
 };
 
 // Exports
