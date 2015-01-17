@@ -173,7 +173,7 @@ function TangoRuntime(logStore, stream) {
     var applyWrite = function(entry, offset) {
         var oid = entry.oid;
         var obj = objectRegistry[oid];
-        if(obj === void(0)) throw 'Tango.logStore.applyWrite: Unregistered object for OID: ' + oid;
+        if(obj === void(0)) throw 'Tango.Runtime.applyWrite: Unregistered object for OID: ' + oid;
         obj.applyUpdate(entry.value, offset);
         advanceTo(oid, offset);
     };
@@ -201,15 +201,15 @@ function TangoRuntime(logStore, stream) {
             case INIT_ENTRY_TYPE:
                 oid = entry.oid;
                 var factory = typeRegistry[entry.typeName];
-                if(objectRegistry[oid] !== void(0)) throw 'Tango.logStore.handleEntry: Duplicate init entries.';
-                if(factory === void(0)) throw 'Tango.logStore.handleEntry: Unrecognized type: ' + entry.typeName;
+                if(objectRegistry[oid] !== void(0)) throw 'Tango.Runtime.handleEntry: Duplicate init entries.';
+                if(factory === void(0)) throw 'Tango.Runtime.handleEntry: Unrecognized type: ' + entry.typeName;
                 objectRegistry[oid] = factory.apply(null, entry.state);
                 advanceTo(oid, offset);
                 break;
             case CHECKPOINT_ENTRY_TYPE:
                 oid = entry.oid;
                 obj = objectRegistry[oid];
-                if(obj === void(0)) throw 'Tango.logStore.handleEntry: Unregistered object for OID: ' + oid;
+                if(obj === void(0)) throw 'Tango.Runtime.handleEntry: Unregistered object for OID: ' + oid;
                 obj.applyCheckpoint(entry.state, offset);
                 advanceTo(oid, offset);
                 break;
@@ -231,10 +231,10 @@ function TangoRuntime(logStore, stream) {
                             });
                 }
             case DECISION_ENTRY_TYPE:
-                throw 'Tango.logStore.handleEntry: Decision entry type not implemented.';
+                throw 'Tango.Runtime.handleEntry: Decision entry type not implemented.';
                 break;
             default:
-                throw 'Tango.logStore.handleEntry: Unexpected entry type (' + entry.type + ')';
+                throw 'Tango.Runtime.handleEntry: Unexpected entry type (' + entry.type + ')';
         };
     };
 
@@ -316,10 +316,10 @@ function TangoRuntime(logStore, stream) {
     // }
 
     self.forget = function(offset) {
-        throw 'Tango.logStore.forget: not implemented';
+        throw 'Tango.Runtime.forget: not implemented';
     };
 
-    // interface ITangoTransaction : ITango {
+    // interface ITangoTransaction : ITangoRuntime {
     //     Promise commit();
     //     Promise abort();
     // }
@@ -331,7 +331,7 @@ function TangoRuntime(logStore, stream) {
         var writeSet = [], readSet = [], completedMsg = '';
 
         self.queryHelper = function(oid/*, stopIndex*/) {
-            if(completedMsg !== '') Q.reject(completedMsg);
+            if(completedMsg !== '') return Q.reject(completedMsg);
             // TODO: XXX Don't include reads that occur after writes conflicting writes.
             // E.g. register.set(T, f(register.get(T))); register.get(T);  The second get should NOT
             // record a read.  The second get should also see the value of the set, so this needs to notify
@@ -341,20 +341,24 @@ function TangoRuntime(logStore, stream) {
         };
 
         self.updateHelper = function(oid, value) {
-            if(completedMsg !== '') Q.reject(completedMsg);
+            if(completedMsg !== '') return Q.reject(completedMsg);
             return logUpdate(oid, value, true)
                     .then(function(offset) { writeSet.push(offset); });
         };
 
         self.checkpointHelper = function(oid, state) {
-            if(completedMsg !== '') Q.reject(completedMsg);
+            if(completedMsg !== '') return Q.reject(completedMsg);
             return logCheckpoint(oid, state, true)
                     .then(function(offset) { writeSet.push(offset); });
         };
 
+        /**
+         * @method commit
+         * @returns {Promise} A promise that completes when the transaction commits successfully.
+         */
         self.commit = function() {
+            if(completedMsg !== '') return Q.reject(completedMsg);
             readSet.sort();
-            if(completedMsg !== '') Q.reject(completedMsg);
             if(writeSet.length > 0 && readSet.length > 0) { // Read-write transaction
                 return logStore.append(stream, {
                     type: COMMIT_ENTRY_TYPE,
@@ -366,7 +370,7 @@ function TangoRuntime(logStore, stream) {
                         .then(function(succeeded) {
                             completedMsg = succeeded ? 'Transaction already committed.'
                                                      : 'Transaction aborted.';
-                            return succeeded;
+                            return succeeded ? Q() : Q.reject('Transaction aborted.');
                         });
                 });
             } else if(writeSet.length > 0) { // Write-only transaction
@@ -377,24 +381,51 @@ function TangoRuntime(logStore, stream) {
                     writeSet: writeSet,
                     deleted: false
                 }).then(function(offset) {
-                    return true; // Write-only transactions can't fail.
+                    return; // Write-only transactions can't fail.
                 });
             } else if(readSet.length > 0) { // Read-only transaction
                 return checkConflicts(readSet, writeSet, readSet[0], readSet[readSet.length-1])
                         .then(function(succeeded) {
                             completedMsg = succeeded ? 'Transaction already committed.'
                                                      : 'Transaction aborted.';
-                            return succeeded;
+                            return succeeded ? Q() : Q.reject('Transaction aborted');
                         });
             } else { // Empty transaction
                 completedMsg = 'Transaction already committed.';
-                return Q(true);
+                return Q();
             }
         };
 
         self.abort = function() {
-            if(completedMsg !== '') Q.reject(completedMsg);
+            if(completedMsg !== '') return Q.reject(completedMsg);
             completedMsg = 'Transaction aborted.';
+            return Q();
+        };
+
+        self.forget = function(offset) {
+            throw 'TangoTransaction.forget: not implemented';
+        };
+
+        /**
+         * @method beginTransaction
+         * @returns {ITangoTransaction} A new nested transaction.
+         */
+        self.beginTransaction = function() {
+            return {
+                localCompletedMsg: '',
+                queryHelper: self.queryHelper,
+                updateHelper: self.updateHelper,
+                checkpointHelper: self.checkpointHelper,
+                forget: self.forget,
+                commit: function() {
+                    if(completedMsg !== '') return Q.reject(completedMsg);
+                    if(localCompletedMsg !== '') return Q.reject(localCompletedMsg);
+                    localCompletedMsg = 'Transaction already committed.';
+                    return Q(); // Do nothing.
+                },
+                abort: self.abort, 
+                beginTransaction: self.beginTransaction
+            };
         };
     };
 
