@@ -30,6 +30,7 @@ var allTrue = function() { return true; };
  * A set of log streams.
  *
  * @class logStore
+ * @param {!IDBDatabase} db An IndexedDB database.
  */
 function logStore(db) {
     var self = this;
@@ -39,30 +40,30 @@ function logStore(db) {
      *
      * @method append
      * @param {!string} stream The stream to which to append.
-     * @param {!object} entry Any object that the structured clone algorithm works on.
+     * @param {*} entry Any object that the structured clone algorithm works on.
      * @returns {Promise} A promise returning the key of the new entry.  This is guaranteed to be monotonically increasing.
      */
     self.append = function(stream, entry) {
         var deferred = Q.defer();
         var transaction = db.transaction(stream, 'readwrite');
-        var request = transaction.objectStore(stream).add({ value: entry });
+        var request = transaction.objectStore(stream).add(entry);
         transaction.oncomplete = function() { deferred.resolve(request.result); };
         transaction.onabort = function() { deferred.reject(); };
         return deferred.promise;
     };
 
     /* This isn't right.  It happens atomically, but it doesn't have a single global offset.
-    self.multiAppend = function(streams, entry) {
-        var deferred = Q.defer();
-        var transaction = db.transaction(streams, 'readwrite');
-        transaction.oncomplete = function() { deferred.resolve(); };
-        transaction.onabort = function() { deferred.reject(); };
-        for(var i = 0; i < streams.length; ++i) {
-            transaction.objectStore(streams[i]).add({ value: entry });
-        }
-        return deferred.promise;
-    };
-    */
+       self.multiAppend = function(streams, entry) {
+       var deferred = Q.defer();
+       var transaction = db.transaction(streams, 'readwrite');
+       transaction.oncomplete = function() { deferred.resolve(); };
+       transaction.onabort = function() { deferred.reject(); };
+       for(var i = 0; i < streams.length; ++i) {
+       transaction.objectStore(streams[i]).add(entry);
+       }
+       return deferred.promise;
+       };
+       */
 
     /**
      * Read an entry at a specified offset.
@@ -82,23 +83,43 @@ function logStore(db) {
         return deferred.promise;
     };
 
+    /**
+     * Called on each item visited in the traversal.  It will be called in log order.
+     *
+     * @callback onNext
+     * @param {*} value The value at the current log offset.
+     * @param {!int} offset The current log offset.
+     * @returns {boolean} A boolean specifying whether to continue traversing or not.
+     */
+
+    /**
+     * Called if an error has occurred during the traversal.
+     *
+     * @callback onError
+     * @param {!error} error The error that occurred.
+     */
+
+    /**
+     * Called when the traversal stops, either due to onNext returning `false` or the end of the stream being reached.
+     * This will not be called if onError is called.
+     *
+     * @callback onCompleted
+     */
 
     /**
      * Traverse a range of log entries.
      *
      * @method traverse
      * @param {!string} stream The stream to traverse.
-     * @param {int=} startIndex The index of where to start the traversal (inclusive).
-     * @param {int=} stopIndex The index of where to stop the traversal (inclusive).
-     * @returns {{onError, onNext, onCompleted}} A roughly Rx.JS-style Observer.  Overwrite
-     *  the methods to handle the events.  onNext gets called on each item and will stop if
-     *  a non-truthy value is returned. onCompleted is called when the traversal stops either
-     *  due to onNext returning false or the end of the stream being reached.
+     * @param {int} [startIndex] The index of where to start the traversal (inclusive).
+     * @param {int} [stopIndex] The index of where to stop the traversal (inclusive).
+     * @returns {{onError: onError, onNext: onNext, onCompleted: onCompleted}} A roughly Rx.JS-style Observer.  Overwrite
+     *  the methods to handle the events.
      */
     self.traverse = function(stream, startIndex /* Optional */, stopIndex /* Optional */) {
         var keyRange = startIndex === void(0) ? void(0) : 
-            stopIndex === undefined ? IDBKeyRange.lowerBound(startIndex)
-                                    : IDBKeyRange.bound(startIndex, stopIndex);
+            stopIndex === void(0) ? IDBKeyRange.lowerBound(startIndex)
+                                  : IDBKeyRange.bound(startIndex, stopIndex);
 
         // Following RxJS naming convention, but not really the feel...
         var observer = { onError: noop, onNext: allTrue, onCompleted: noop };
@@ -109,7 +130,15 @@ function logStore(db) {
         cursorRequest.onsuccess = function(evt) {
             var cursor = evt.target.result;
             if(cursor) {
-                if(observer.onNext(cursor.value)) cursor.continue(); else observer.onCompleted();
+                try {
+                    if(observer.onNext(cursor.value, cursor.key)) {
+                        cursor.continue();
+                    } else {
+                        observer.onCompleted();
+                    }
+                } catch(e) {
+                    observer.onError(e);
+                }
             } else {
                 observer.onCompleted();
             }
@@ -128,7 +157,7 @@ function logStore(db) {
         var deferred = Q.defer();
         var transaction = db.transaction(stream, 'readonly');
         transaction.onabort = function() { deferred.reject(); };
-        transaction.objectStore(stream).openCursor(undefined, 'prev').onsuccess = function(evt) {
+        transaction.objectStore(stream).openCursor(void(0), 'prev').onsuccess = function(evt) {
             var cursor = evt.target.result;
             if(cursor) {
                 deferred.resolve(cursor.key);
@@ -172,8 +201,9 @@ LogStore.init = function(streams) {
     };
     openRequest.onupgradeneeded = function(evt) {
         var db = evt.target.result;
-        for(var i = 0; i < newStreams.length; ++i) {
-            db.createObjectStore(newStreams[i], { keyPath: '_index', autoIncrement: true });
+        var len = newStreams.length;
+        for(var i = 0; i < len; ++i) {
+            db.createObjectStore(newStreams[i], { autoIncrement: true });
         }
     };
     return deferred.promise;
