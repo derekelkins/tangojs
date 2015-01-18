@@ -84,7 +84,7 @@ function TangoRuntime(logStore, stream) {
                     if(oid === void(0)) {
                         oid = newOid();
                         return persistentNameMap.put(self, name, oid)
-                                .then(function() { return oid; });
+                                .thenResolve(oid);
                     } else {
                         return oid;
                     }
@@ -114,7 +114,7 @@ function TangoRuntime(logStore, stream) {
      * @param {!string} typeName The name of the type to instantiate.
      * @param {!string} name The name of the object.
      * @param {...*} args Any additional arguments needed to instantiate the object.
-     * @returns {Promise} A promise that returns the latest version of the object.
+     * @returns {Promise.<ITangoObject>} A promise that returns the latest version of the object.
      */
     self.fetch = function(typeName, name) {
         var args = Array.prototype.slice.call(arguments, 2);
@@ -128,7 +128,45 @@ function TangoRuntime(logStore, stream) {
     //     Promise<int> checkpointHelper(int oid, any state);
     // }
 
-    // walk the log seeing if any writes conflict with the reads in readSet in the interval
+    var checkCommitEntry = function(entry, offset) {
+        var readSet = entry.readSet, writeSet = entry.writeSet;
+        if(readSet.length === 0) { // Write-only transactions can't fail.
+            return Q(true);
+        } else {
+            return checkConflicts(readSet, writeSet, Math.min(readSet[0], writeSet[0]), offset-1);
+        }
+    };
+    
+    // Walk the writeSet of a potentially conflicting commit.
+    var checkWriteSetConflicts = function(reads, innerEntry, innerOffset) {
+        // TODO: XXX Need to be able to skip aborted transactions somehow.
+        // Preferably without having to recursively check them.
+        return checkCommitEntry(innerEntry, innerOffset)
+                .then(function(committed) {
+                    if(committed) {
+                        var writeSet = innerEntry.writeSet;
+                        return Q.all(writeSet.map(function(offset) { return logStore.read(stream, offset); }))
+                                .then(function(entries) {
+                                    var len = entries.length;
+                                    var succeeded = true, entry;
+                                    for(var i = 0; i < len; ++i) {
+                                        entry = entries[i];
+                                        if(entry.type === COMMIT_ENTRY_TYPE || entry.type === DECISION_ENTRY_TYPE)
+                                            throw 'TangoRuntime.checkWriteSetConflicts: Bad write set: ' + JSON.stringify(writeSet);
+                                        if(reads[entry.oid] !== void(0)) {
+                                            succeeded = false;
+                                            break;
+                                        }
+                                    }
+                                    return succeeded;
+                                });
+                    } else { 
+                        return true;
+                    }
+                });
+    };
+
+    // Walk the log seeing if any writes conflict with the reads in readSet in the interval.
     // Pre-conditions:
     //  - readSet and writeSet are in order of ascending offsets
     //  - Offsets in readSet or writeSet are always INIT/UPDATE/CHECKPOINT, NEVER COMMIT/DECISION.
@@ -138,6 +176,7 @@ function TangoRuntime(logStore, stream) {
     var checkConflicts = function(readSet, writeSet, startIndex, stopIndex) {
         var reads = {}, readIx = 0, writeIx = 0;
         var aborted = false;
+        var sidetracks = [];
         var deferred = Q.defer();
         var observer = logStore.traverse(stream, startIndex, stopIndex);
         observer.onNext = function(entry, offset) {
@@ -146,25 +185,44 @@ function TangoRuntime(logStore, stream) {
                     throw 'TangoRuntime.checkConflicts: Bad read set: ' + JSON.stringify(readSet) + ' at offset ' + offset;
                 reads[entry.oid] = entry;
                 readIx++;
-                return true
+                return true;
             } else if(offset === writeSet[writeIx]) {
                 if(entry.type === COMMIT_ENTRY_TYPE || entry.type === DECISION_ENTRY_TYPE)
                     throw 'TangoRuntime.checkConflicts: Bad write set: ' + JSON.stringify(writeSet) + ' at offset ' + offset;
                 writeIx++;
-                return true
+                return true;
             } else {
-                if(reads[entry.oid] !== void(0)) { // conflict
+                if(entry.type === COMMIT_ENTRY_TYPE && !entry.deleted) {
+                    sidetracks.push(checkWriteSetConflicts(reads, entry, offset));
+                    return true;
+                } else if(entry.type === DECISION_ENTRY_TYPE && !entry.deleted) { // TODO
+                    throw 'TangoRuntime.checkConflicts: DECISION_ENTRY_TYPE not implemented.';
+                } else if(reads[entry.oid] !== void(0) && !entry.speculative && !entry.deleted) { // conflict
                     // TODO: This needs to be more fine-grained, which also means using an
                     // object indexed only by oid is inadequate.
                     aborted = true;
                     return false;
                 } else {
-                    return true
+                    return true;
                 }
             }
         };
         observer.onError = function(err) { deferred.reject(err); };
-        observer.onCompleted = function() { deferred.resolve(aborted); };
+        observer.onCompleted = function() { 
+            if(aborted) {
+                deferred.resolve(false);
+            } else {
+                Q.all(sidetracks).then(function(didSucceed) {
+                    var len = didSucceed.length;
+                    for(var i = 0; i < len; ++i) {
+                        if(!didSucceed[i]) {
+                            deferred.resolve(false);
+                        }
+                    }
+                    deferred.resolve(true);
+                }).done();
+            }
+        };
         return deferred.promise;
     };
 
@@ -177,7 +235,7 @@ function TangoRuntime(logStore, stream) {
 
     var applyWrite = function(entry, offset) {
         var oid = entry.oid;
-        var entryType = entry.Type;
+        var entryType = entry.type;
         if(entryType === INIT_ENTRY_TYPE) {
             applyInit(entry, oid);
         } else {
@@ -238,7 +296,7 @@ function TangoRuntime(logStore, stream) {
                 if(readSet.length === 0) { // Write-only transactions can't fail.
                     return applyWrites(writeSet);
                 } else {
-                    return checkConflicts(readSet, writeSet, Math.min(readSet[0], writeSet[0]), offset)
+                    return checkConflicts(readSet, writeSet, Math.min(readSet[0], writeSet[0]), offset-1)
                             .then(function(succeeded) {
                                 if(succeeded) {
                                     return applyWrites(writeSet);
@@ -289,6 +347,7 @@ function TangoRuntime(logStore, stream) {
                     observer.onNext = onNext;
                     observer.onCompleted = onCompleted;
                 }).done();
+                sidetrack = void(0);
             } else {
                 deferred.resolve(); 
             }
@@ -346,6 +405,7 @@ function TangoRuntime(logStore, stream) {
     var TangoTransaction = function(offsets) {
         var self = this;
         var writeSet = [], readSet = [], completedMsg = '';
+        var readHash = {}, writeHash = {};
 
         self.queryHelper = function(oid/*, stopIndex*/) {
             if(completedMsg !== '') return Q.reject(completedMsg);
@@ -353,20 +413,31 @@ function TangoRuntime(logStore, stream) {
             // E.g. register.set(T, f(register.get(T))); register.get(T);  The second get should NOT
             // record a read.  The second get should also see the value of the set, so this needs to notify
             // a parallel copy of the object to apply the update represented by the write.
-            readSet.push(offsets[oid]);
+            // 
+            // And, um, don't push duplicate reads ...
+            if(!readHash[oid] && !writeHash[oid]) {
+                readSet.push(offsets[oid]);
+                readHash[oid] = true;
+            }
             return Q();
         };
 
         self.updateHelper = function(oid, value) {
             if(completedMsg !== '') return Q.reject(completedMsg);
             return logUpdate(oid, value, true)
-                    .then(function(offset) { writeSet.push(offset); });
+                    .then(function(offset) { 
+                        writeSet.push(offset); 
+                        writeHash[oid] = true;
+                    });
         };
 
         self.checkpointHelper = function(oid, state) {
             if(completedMsg !== '') return Q.reject(completedMsg);
             return logCheckpoint(oid, state, true)
-                    .then(function(offset) { writeSet.push(offset); });
+                    .then(function(offset) { 
+                        writeSet.push(offset); 
+                        writeHash[oid] = true;
+                    });
         };
 
         /**
@@ -383,7 +454,7 @@ function TangoRuntime(logStore, stream) {
                     writeSet: writeSet,
                     deleted: false
                 }).then(function(offset) {
-                    return checkConflicts(readSet, writeSet, Math.min(readSet[0], writeSet[0]), offset)
+                    return checkConflicts(readSet, writeSet, Math.min(readSet[0], writeSet[0]), offset-1)
                         .then(function(succeeded) {
                             completedMsg = succeeded ? 'Transaction already committed.'
                                                      : 'Transaction aborted.';
@@ -425,10 +496,10 @@ function TangoRuntime(logStore, stream) {
 
         /**
          * @method beginTransaction
-         * @returns {ITangoTransaction} A new nested transaction.
+         * @returns {Promise.<ITangoTransaction>} A promise returning a new nested transaction.
          */
         self.beginTransaction = function() {
-            return {
+            return Q({
                 localCompletedMsg: '',
                 queryHelper: self.queryHelper,
                 updateHelper: self.updateHelper,
@@ -442,20 +513,22 @@ function TangoRuntime(logStore, stream) {
                 },
                 abort: self.abort, 
                 beginTransaction: self.beginTransaction
-            };
+            });
         };
     };
 
     /**
      * @method beginTransaction
-     * @returns {ITangoTransaction} A new transaction.
+     * @returns {Promise.<ITangoTransaction>} A promise returning a new transaction.
      */
     self.beginTransaction = function() {
-        var offsetsSnapshot = {};
-        Object.keys(offsets).forEach(function(oid) {
-            offsetsSnapshot[oid] = offsets[oid];
+        return  self.queryHelper(0).then(function() {
+            var offsetsSnapshot = {};
+            Object.keys(offsets).forEach(function(oid) {
+                offsetsSnapshot[oid] = offsets[oid];
+            });
+            return new TangoTransaction(offsetsSnapshot);
         });
-        return new TangoTransaction(offsetsSnapshot);
     };
 
     // Initialization
@@ -475,7 +548,7 @@ function TangoRuntime(logStore, stream) {
 
 /**
  * @method init
- * @returns {Promise} A promise that returns a ready `Runtime` object.
+ * @returns {Promise.<ITangoRuntime>} A promise that returns a ready `Runtime` object.
  */
 TangoRuntime.init = function(logStore, stream) {
     return new TangoRuntime(logStore, stream).init();
@@ -505,7 +578,7 @@ function TangoRegister(oid, initialValue) {
     /**
      * @method get
      * @param {!ITango} T The transaction that contains this action.
-     * @returns {Promise} A promise that returns the value of the register.
+     * @returns {Promise.<*>} A promise that returns the value of the register.
      */
     self.get = function(T) {
         return T.queryHelper(oid).then(function() { return box; });
@@ -548,7 +621,7 @@ function TangoCounter(oid, initialValue) {
     /**
      * @method get
      * @param {!ITango} T The transaction that contains this action.
-     * @returns {Promise} A promise that returns the current value of the counter.
+     * @returns {Promise.<int>} A promise that returns the current value of the counter.
      */
     self.get = function(T) {
         return T.queryHelper(oid).then(function() { return box; });
@@ -639,7 +712,7 @@ function TangoQueue(oid) {
      *
      * @method head
      * @param {!ITango} T The transaction that contains this action.
-     * @returns {Promise} A promise that returns the item at the front of the queue or undefined if the queue is empty.
+     * @returns {Promise.<*>} A promise that returns the item at the front of the queue or undefined if the queue is empty.
      */
     self.head = function(T) {
         return T.queryHelper(oid).then(function() { 
@@ -698,7 +771,7 @@ function TangoMap(oid, initialMapping) {
      * @method get
      * @param {!ITango} T The transaction that contains this action.
      * @param {!string|int} key The key to look up.
-     * @returns {Promise} A promise that returns the current value of the key or undefined if the key does not exist.
+     * @returns {Promise.<*>} A promise that returns the current value of the key or undefined if the key does not exist.
      */
     self.get = function(T, key) {
         return T.queryHelper(oid).then(function() { return map[key]; });
