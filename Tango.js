@@ -328,16 +328,22 @@ function TangoRuntime(logStore, stream) {
         var writeSet = [], readSet = [], completedMsg = '';
         var readHash = {}, writeHash = {};
 
-        self.queryHelper = function(oid/*, stopIndex*/) {
+        self.queryHelper = function(oid, keyFn/*, stopIndex*/) {
             if(completedMsg !== '') return Q.reject(completedMsg);
             // TODO: XXX 
             // E.g. register.set(T, f(register.get(T))); register.get(T);
             // The second get should see the value of the set, so this needs to notify
             // a parallel copy of the object to apply the update represented by the write.
             if(!readHash[oid] && !writeHash[oid]) {
-                readSet.push({ oid: oid, offset: offsets[oid], version: objectVersions[oid].customVersion });
+                var customVersion = objectVersions[oid].customVersion;
+                readSet.push({ 
+                    oid: oid, 
+                    offset: offsets[oid], 
+                    version: keyFn !== void(0) ? keyFn(customVersion) : customVersion
+                });
                 readHash[oid] = true;
-            }
+            } // TODO: Presumably we can check the versions of the current objects and abort without
+              // writing the commit record rather than waste time.
             return Q();
         };
 
@@ -492,10 +498,10 @@ function TangoRegister(oid, initialValue) {
         return false; // If the checkpoint check didn't fail, then the versions are the same.
     };
     self.initializeVersion = function(offset) {
-        return undefined;
+        return void(0);
     };
     self.updateVersion = function(currentVersion, update, offset) {
-        return undefined;
+        return void(0);
     };
 
     /**
@@ -628,11 +634,11 @@ function TangoQueue(oid) {
             }
         }
     };
-    self.versionsConflict = function(currentVersion, oldVersion) { // TODO: XXX Improve me.
+    self.versionsConflict = function(currentVersion, oldVersion) {
         return currentVersion !== oldVersion;
     };
     self.initializeVersion = function(offset) {
-        return offset;
+        return 0;
     };
     self.updateVersion = function(currentVersion, update, offset) {
         return offset;
@@ -707,14 +713,22 @@ function TangoMap(oid, initialMapping) {
     self.applyCheckpoint = function(state) {
         map = state;
     };
-    self.versionsConflict = function(currentVersion, oldVersion) { // TODO: XXX Improve me.
-        return currentVersion !== oldVersion;
+    self.versionsConflict = function(currentVersion, oldVersion) {
+        var key = oldVersion.key;
+        return currentVersion[key] !== oldVersion.version;
     };
     self.initializeVersion = function(offset) {
-        return offset;
+        var initialVersions = {};
+        var keys = Object.keys(initialMapping);
+        var len = keys.length;
+        for(var i = 0; i < len; ++i) {
+            initialVersions[keys[i]] = offset;
+        }
+        return initialVersions;
     };
     self.updateVersion = function(currentVersion, update, offset) {
-        return offset;
+        currentVersion[update[0]] = offset;
+        return currentVersion;
     };
 
     /**
@@ -724,7 +738,8 @@ function TangoMap(oid, initialMapping) {
      * @returns {Promise.<*>} A promise that returns the current value of the key or undefined if the key does not exist.
      */
     self.get = function(T, key) {
-        return T.queryHelper(oid).then(function() { return map[key]; });
+        return T.queryHelper(oid, function(version) { return { key: key, version: version[key] };  })
+                .then(function() { return map[key]; });
     };
 
     /**

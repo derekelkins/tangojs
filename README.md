@@ -125,12 +125,12 @@ struct Update {
     Unique Oid;
     Opaque? Key; // Really this would be in the Value.  As the conflict mechanism is pluggable.
     Opaque Value;
-    bool Deleted; // "Trimmed."  Not actually stored on disk in CORFU.
+    bool Deleted; // "Trimmed."  Not actually stored on disk in CORFU, but this isn't CORFU.
     bool Speculative; // An update that should be ignored, but will be referenced in a (successful) commit record.
 }
 
 struct CommitRecord {
-    Set<int> ReadOffsets;
+    Set<int> ReadOffsets; // Probably most convenient to represent these sets as sorted lists, earliest offset first.
     Set<int> WriteOffsets;
 }
 

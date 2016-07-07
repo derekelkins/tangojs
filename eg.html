@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+    <title>Test</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script type="text/javascript" src="vendor/q.js"></script>
+    <script type="text/javascript" src="LogStore.js"></script>
+    <script type="text/javascript" src="Tango.js"></script>
+</head>
+<body>
+<script type="text/javascript">
+Q.longStackSupport = true;
+
+function displayLog(stream) {
+    var observer = window.db.traverse(stream || 'test');
+    observer.onNext = function(value, offset) {
+        console.log(JSON.stringify([offset, value]));
+        return true;
+    };
+}
+
+function show(x) {
+    console.log(x);
+}
+
+LogStore.init(['test']).then(function(_db) { 
+    window.db = _db; 
+    return Tango.Runtime.init(_db, 'test')
+})
+.then(function(_T) {
+    window.T = _T;
+
+    _T.fetch(Tango.Register.TYPE_NAME, 'x', 10).then(function(obj) {
+        window.x = obj;
+    }).done();
+    _T.fetch(Tango.Queue.TYPE_NAME, 'q').then(function(obj) {
+        window.q = obj;
+    }).done();
+    _T.fetch(Tango.Counter.TYPE_NAME, 'c').then(function(obj) {
+        window.c = obj;
+    }).done();
+});
+</script>
+Change the design to (pre-)register listeners by name.  Then init entries and typeNames should not be necessary.
+The tricky parts of this approach is what happens if you register after the log has started being played forward?
+Conflict handling is also still tricky.
+<pre>
+</pre>
+</body>
+</html>
