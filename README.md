@@ -1,10 +1,16 @@
 # Untangling the Tango paper
 
+I wrote this at the beginning of 2015.  In addition to the notes here, there is a much more complete (but
+not fully complete) [JavaScript implementation](https://github.com/derekelkins/tangojs/) using IndexedDB 
+as the "shared" log, though this is abstracted so it would be possible to swap out with some other storage, 
+possibly remote.
+
 ## What
 
 The [Tango paper](http://www.cs.cornell.edu/~taozou/sosp13/tangososp.pdf) looks interesting, but it isn't the
 clearest paper. It's mainly lacking detail and clear definitions. This is my attempt to guess at some of the
-details. I'm less interested in the CORFU parts, so I will spend less time on them.
+details and provide some clarifications to make the paper easier to read. I'm less interested in the CORFU parts, 
+so I will spend less time on them.
 
 ## Sections
 
